@@ -1052,18 +1052,20 @@ class SavedBaselineTests(unittest.TestCase):
                         "support['database'].D13":np.ones(1)}
             np.savez(reference, **expected, initial_y=np.asarray([1.,2.,3.]),
                      final_y=np.asarray([1.,2.,3.]), final_time=np.asarray(0.))
-            for mismatch in (False,True):
+            for continuing,mismatch in ((False,False),(False,True),(True,False),(True,True)):
                 neo.database.D13 = np.asarray([np.nextafter(1.,2.) if mismatch else 1.])
                 snapshot = root/f'live_{mismatch}.npz'
                 np.savez(snapshot, **dict(expected, **{"support['database'].D13":neo.database.D13}))
                 namespace['save_gradient_audit'].return_value = snapshot
-                out = root/str(mismatch)
+                out = root/f'{continuing}_{mismatch}'
                 argv = ['fd','--config',str(cfg_path),'--parameter','density_shape_alpha',
                     '--ntx-scan-audit-dir',str(out),'--ntx-scan-audit-compiler-ir',
-                    '--ntx-scan-audit-until-reference','--ad-baseline-reference',str(reference),
+                    '--ntx-scan-audit-continue' if continuing else '--ntx-scan-audit-until-reference',
+                    '--ad-baseline-reference',str(reference),
                     '--initial-Er-root-ad','jax_selected_root',
                     '--initial-Er-root-fd-root-lane','frozen_linearized',
-                    '--replay-mode','accepted','--fd-accepted-replay-contract','reverse_frozen_metadata']
+                    '--replay-mode','accepted','--fd-accepted-replay-contract','reverse_frozen_metadata',
+                    '--accepted-step-limit','16']
                 # The real capture context creates the directory on exit.
                 out.mkdir()
                 with patch.object(sys,'argv',argv), patch.dict(sys.modules,{
@@ -1073,14 +1075,22 @@ class SavedBaselineTests(unittest.TestCase):
                     if mismatch:
                         with self.assertRaisesRegex(ValueError,'geometry/database arrays differ'):
                             namespace['main']()
+                    elif continuing:
+                        with self.assertRaisesRegex(AssertionError,'transport reached'):
+                            namespace['main']()
                     else:
                         self.assertIs(namespace['main'](),check.PRE_TRANSPORT_CAPTURE)
                 self.assertEqual(bool(json.loads((out/'ad_support_comparison.json').read_text())),mismatch)
-        self.assertEqual(constructor.call_count,2)
+        self.assertEqual(constructor.call_count,4)
         self.assertNotIn('jax',sys.modules)
-        namespace['_schedule_rollout'].assert_not_called()
+        namespace['_schedule_rollout'].assert_called_once()
+        call = namespace['_schedule_rollout'].call_args
+        self.assertIs(call.args[0],config)
+        self.assertIs(call.args[1],runtime)
+        np.testing.assert_array_equal(call.args[2].Er,state.Er)
+        self.assertEqual(call.kwargs,dict(accepted_step_limit=16,capture_newton_setup=True))
         self.assertEqual([options for _,options in capture_calls],
-                         [dict(reference=None,compiler_ir=True)]*4)
+                         [dict(reference=None,compiler_ir=True)]*6)
         self.assertEqual(active,[])
         self.assertEqual(_jax_before,'jax' in sys.modules)
 

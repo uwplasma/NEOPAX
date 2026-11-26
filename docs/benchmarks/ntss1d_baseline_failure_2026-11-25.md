@@ -159,6 +159,78 @@ or establish AD/FD gradient accuracy.
 
 No extra outer JIT, compiler options, solver changes, equilibrium, NTX,
 root, transport, or derivative calculation is introduced. Local tests
-use NumPy and mocks only. Both real saved Boozer captures pass the local
-argument/schema preflight; CUDA repeatability remains to be tested on
-the large machine.
+use NumPy and mocks only. Both real saved Boozer captures passed the local
+argument/schema preflight before the CUDA replay below.
+
+### CUDA replay result
+
+Run `outputs/boozer_saved_repeat_YQODRN`, NEOPAX `18c5b99`, JAX 0.10.0,
+CUDA FP64, completed with exit status 0. Each of two fresh processes
+compiled the original Boozer function once and evaluated it 20 times.
+All 40 outputs match the original saved capture byte-for-byte. There
+are no within-process or between-process output differences. This
+control provides no evidence of a nondeterministic original Boozer
+call for these arguments. It does not reproduce or repair the earlier
+failed full initialization.
+
+Source review distinguishes the transform from its consumers:
+`_build_neopax_geometry_from_state` takes `bmnc_b[:, mode00]` from the
+full Boozer output and interpolates it from `sample_rho` onto the
+transport cell centers to form `B0`. Then
+`_build_ntx_runtime_channels_from_geometry` interpolates `B0` onto the
+NTX radii to form channel `b00`. Both use the configured
+`interpax.Interpolator1D`; the 40-call Boozer replay does not execute
+either interpolation. These operations are candidates to distinguish
+in a failed capture, not established causes.
+
+The original initialization's `--ntx-scan-audit-compiler-ir` mode now
+also captures the actual geometry and Boozer boundaries. A build
+that fails its original support guard is needed to compare transform
+inputs, transform outputs and resulting geometry in that execution.
+The existing passing geometry captures and isolated replay cannot
+provide that missing failed boundary. No numerical correction,
+guard relaxation or solver-method change follows from these passing
+results.
+
+### Original initialization result and remaining FD columns
+
+Run `outputs/original_geometry_failure_Vpk7oO` completed three original
+NTSS1D initializations with geometry/Boozer and actual NTX scan capture
+enabled. All three passed the original support guard: transport geometry
+and coefficient tables match archived AD exactly. Each fresh initial Er
+also matches saved AD with maximum absolute difference `0.0`. At `(6,0,7)`
+all three report `Es=0x1.c035ba9ccdabep-7` and raw D13
+`2.89369301593999`. These runs stop before transport and FD endpoints.
+They did not reproduce the earlier failure; they do not establish a fix.
+
+The original generic comparison already contains all 104 pairs. The saved
+NTSS1D run contains AD16 and four completed profile FD columns, or 52 pairs.
+Its missing FD columns are density shape alpha, temperature shape alpha,
+RBC:1:0 and ZBS:1:0. The NEOPAX package and AD benchmark source are unchanged
+between archived `6cbe394` and `18c5b99`; FD benchmark changes concern
+diagnostic observation and early stopping. The ordinary runner still
+rejects resuming an archived run after its source fingerprint changes.
+
+`complete_saved_transport_fd.py` instead creates a separate follow-up
+against saved AD. It copies completed summaries/snapshots, records their
+provenance, and uses the existing command builder for only the missing
+FD columns. The original directory is untouched. Saved config, FD
+increments, step limit and solver-mean scope are retained. Installed
+package versions must match the saved AD metadata. Original baseline
+support and exact state/time guards remain in effect. Its output table
+combines archived pairs and follow-up pairs; it is explicitly labeled
+as a saved-AD comparison, not a fresh all-worker run.
+
+`--ntx-scan-audit-continue` retains actual upstream geometry/Boozer and NTX
+baseline evidence, then proceeds through the same original FD calculation.
+It requires an AD reference and cannot combine with the existing early-stop
+audit option. Captured baseline arrays are not substituted or used to
+relax a guard. The capture context exits before transport, releasing its
+temporary retained records. If a future worker fails a guard, its actual
+upstream evidence is retained without rerunning the failed initialization.
+
+Local NumPy/AST/mock checks cover one-ULP guard failure in both audit
+modes, unchanged transport arguments on continuation, four-worker planning,
+baseline validation and preservation of the original run. A plan-only
+read of the real archived case selects exactly the four missing FD columns.
+No local JAX import or physics calculation was performed.

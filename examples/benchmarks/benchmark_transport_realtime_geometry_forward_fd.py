@@ -1482,6 +1482,8 @@ def main() -> None:
         help="With --ntx-scan-audit-dir, observe actual NTX preparation and scan compilations without another JIT.")
     parser.add_argument("--ntx-scan-audit-until-reference", action="store_true",
         help="Continue the scan capture through the original profile constructor and AD baseline-support guard, then stop before transport. Guard failures still propagate.")
+    parser.add_argument("--ntx-scan-audit-continue", action="store_true",
+        help="Save the actual baseline geometry/NTX captures, then complete the original guarded FD benchmark.")
     args = parser.parse_args()
     if args.geometry_fd_native_precision == "extended" and (
         args.parameter in PARAMETER_ORDER or args.geometry_fd_lane != "frozen_linearized"
@@ -1510,6 +1512,10 @@ def main() -> None:
         parser.error("--ntx-scan-audit-compiler-ir requires --ntx-scan-audit-dir")
     if args.ntx_scan_audit_until_reference and (args.ntx_scan_audit_dir is None or args.ad_baseline_reference is None):
         parser.error("--ntx-scan-audit-until-reference requires --ntx-scan-audit-dir and --ad-baseline-reference")
+    if getattr(args, "ntx_scan_audit_continue", False) and (
+        args.ntx_scan_audit_dir is None or args.ad_baseline_reference is None or args.ntx_scan_audit_until_reference
+    ):
+        parser.error("--ntx-scan-audit-continue requires a scan directory and AD reference, without --ntx-scan-audit-until-reference")
     if args.ntx_scan_audit_dir is not None:
         if (args.geometry_input_only_dir is not None or args.baseline_only_dir is not None
             or args.initial_er_root_only_fd):
@@ -1630,7 +1636,7 @@ def main() -> None:
             for row in rows:
                 print(f"[ntx-live] {row}",flush=True)
         from check_saved_transport_baseline_repeatability import PRE_TRANSPORT_CAPTURE
-        if not args.ntx_scan_audit_until_reference:
+        if not args.ntx_scan_audit_until_reference and not args.ntx_scan_audit_continue:
             print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
             return PRE_TRANSPORT_CAPTURE
     if args.geometry_input_only_dir is not None:
