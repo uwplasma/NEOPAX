@@ -966,3 +966,69 @@ Three NumPy tests check column order, unchanged factors, partial panels,
 empty inputs, invalid shapes and strict dtype/signed-zero comparisons
 without importing JAX. A regression test also verifies that exposing the
 existing application residual leaves every previous budget value unchanged.
+
+## RHS batching does not provide an accuracy correction
+
+`outputs/lu_rhs_layout_aWFiDK/data` at `aef8a7a` completed on JAX 0.10.0
+CUDA using the same captured factors and original parameter step. The
+native control reproduces all three captured matrix and source solutions
+with strict dtype/byte equality. All layouts repeat deterministically.
+The [reported summary](ntx_lu_rhs_layout_2026-11-25.csv) is:
+
+| Columns per LU call | Estimated raw D13 FD-error contribution | Maximum residual action norm | Median seconds |
+| --- | ---: | ---: | ---: |
+| Native | `2.899943e-03` | `1.262226e-02` | `1.995633e-03` |
+| 1 | `-3.539256e-03` | `4.026942e-03` | `2.099159e-01` |
+| 16 | `-1.419715e-03` | `1.459493e-02` | `5.505010e-02` |
+| 64 | `-2.299137e-03` | `1.325630e-02` | `1.118871e-02` |
+
+Single-column calls reduce the residual action norm but worsen the
+magnitude of the FD error contribution, while taking approximately
+`1.05e02` times longer. Sixteen-column calls give a smaller FD contribution
+but a worse residual norm, consistent with cancellation rather than a
+demonstrated overall accuracy improvement. No tested panel width gives a
+reliable accuracy correction. The panel implementation remains confined
+to the diagnostic; no batching change is applied to production SOLVAX.
+
+The installed JAX triangular-solve interface exposes no accumulation
+precision selector. The tests now distinguish this remaining application
+accuracy issue from the previously corrected product reproducibility
+issue. They do not prove that LU/block-Thomas equations are invalid.
+A higher-accuracy application or an explicit residual-correction step
+would be a new numerical implementation to validate. The one-step
+refinement proposal remains unimplemented pending the user's explicit
+numerical-method approval. Neither these batching results nor the version
+comparison authorize changing the NEOPAX solver configuration.
+
+## Approved one-step correction and timing comparison
+
+The user approved implementing and testing a single LU residual correction
+on 2026-11-25, then asked whether it affects SOLVAX forward and AD timings.
+The approval is specific to this correction; no NEOPAX integration,
+timestep, tolerance, physics or acceptance setting is changed.
+
+An experimental SOLVAX helper now reuses the existing factors and pivots,
+computes a CUDA FP64 two-word residual of the factored system, and applies
+one correction with the same factors. Its forward and transpose solves
+are differentiated through the linear equation; the correction arithmetic
+is not retained as an AD tape. The helper is not enabled in `direct.py`.
+Four NumPy tests pass locally without importing JAX. Three opt-in CUDA
+tests remain to be run, covering compiled arithmetic, primal/transpose
+solutions and derivative consistency. There is no CUDA accuracy or timing
+result yet.
+
+`check_saved_lu_rhs_layout.py --columns-per-call 0 --compare-lu-refinement`
+compares native and corrected applications of the same saved factors and
+RHSs. The native control must match the capture. It retains the original
+parameter step and all prior error/residual measurements, adding separate
+forward, primal-plus-JVP and primal-plus-VJP timings and compiled memory
+in `ad_timing.csv`. The JVP and VJP use identical deterministic dense probes
+in both variants. They report duality and whether their primal outputs
+match the separately compiled forward application. The correction's source
+path/hash, compiler IR and result arrays are retained.
+
+This benchmark measures the isolated LU work at the captured dimensions.
+Its AD timings include their primal evaluation. It does not predict full
+AD16 or optimization overhead, and compiled buffers are not host RSS.
+No physical rollout, new factorization, FD-step adjustment or production
+activation is part of this saved-point comparison.
