@@ -20,6 +20,56 @@ spec.loader.exec_module(replay)
 
 
 class PointReplayTests(unittest.TestCase):
+    def test_thread_probe_compares_same_inputs_and_rejects_a_confounded_control(self):
+        spec=importlib.util.spec_from_file_location('thread_context',FILE.with_name('check_vmec_thread_context.py'))
+        probe=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        for confounded in (False,True):
+            with self.subTest(confounded=confounded),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);source=root/'source';out=root/'out'
+                (source/'ad/snapshots').mkdir(parents=True)
+                (source/'config.toml').write_text('# comparison: steps=16 rel=3e-7 abs=1e-10 mean=fixed capture_forward_ir=True source=abc\n')
+                np.savez(source/'ad/snapshots/ad_compact_geometry_saved.npz',**{'state.R_cos':np.ones((1,2))})
+                calls=[]
+                def worker(command,folder,env):
+                    calls.append((folder.name,env))
+                    self.assertNotIn('--ad-baseline-reference',command)
+                    self.assertIn('--geometry-input-only-dir',command)
+                    self.assertIn('--geometry-input-compiler-ir',command)
+                    data={'capture.params.rbc':np.ones(1),'capture.config.ftol':np.asarray(1e-16),
+                          'capture.outputs.R_cos':np.ones((1,2))}
+                    if folder.name=='single_thread':
+                        data['capture.outputs.R_cos'][0,0]=np.nextafter(1.,2.)
+                        if confounded:
+                            data['capture.config.ftol']=np.asarray(2e-16)
+                    dest=folder/'inputs/geometry';dest.mkdir(parents=True)
+                    np.savez(dest/'solve.npz',**data)
+                    np.savez(dest/'host.npz',**{'capture.outputs.state.R_cos':data['capture.outputs.R_cos']})
+                    np.savez(dest/'refine.npz',**{'capture.outputs.R_cos':data['capture.outputs.R_cos']})
+                    (dest/'boundaries.json').write_text(json.dumps([
+                        dict(stage='vmec_solve',file='solve.npz'),dict(stage='vmec_host',file='host.npz'),
+                        dict(stage='vmec_refinement',file='refine.npz')]))
+                    (dest/'loaded_sources.json').write_text(json.dumps({'vmex.core.implicit':{'sha256':'same'}}))
+                    (dest/'runtime_environment.json').write_text(json.dumps(dict(environment=env,
+                        threadpools=[{'num_threads':int(env['OPENBLAS_NUM_THREADS'])}])))
+                with patch.object(sys,'argv',['probe','--run-dir',str(source),'--out-dir',str(out)]), \
+                     patch.object(probe.runner,'worker_environment',return_value={'OPENBLAS_NUM_THREADS':'4','OMP_NUM_THREADS':'3'}), \
+                     patch.object(probe.runner,'worker',side_effect=worker),redirect_stdout(io.StringIO()):
+                    if confounded:
+                        with self.assertRaisesRegex(ValueError,'Inputs or sources also changed'):
+                            probe.main()
+                    else:
+                        probe.main()
+                self.assertEqual([name for name,_ in calls],['inherited','single_thread'])
+                a,b=(env for _,env in calls)
+                self.assertEqual([name for name in a if a[name]!=b[name]],['OPENBLAS_NUM_THREADS','OMP_NUM_THREADS'])
+                report=json.loads((out/'comparison.json').read_text())
+                self.assertEqual(bool(report['arguments']),confounded)
+                self.assertEqual(report['vs_saved_ad']['inherited'],[])
+                self.assertEqual(report['vs_saved_ad']['single_thread'][0]['different_entries'],1)
+                self.assertEqual(report['internal_phases']['vmec_host']['call_counts'],[1,1])
+        self.assertNotIn('jax',sys.modules)
+
     def test_geometry_capture_keeps_actual_calls_and_saves_boundaries_after_failure(self):
         active, calls = [], []
         state = SimpleNamespace(R_cos=np.asarray([[1.,2.]]))
@@ -27,6 +77,37 @@ class PointReplayTests(unittest.TestCase):
         tables = SimpleNamespace(bmnc=np.asarray([[3.,4.]]), nfp=2)
         result = {'bmnc_b':np.asarray([[5.,6.]]), 'gmnc_b':np.asarray([[7.,8.]])}
         geometry = SimpleNamespace(B0=np.asarray([5.]))
+        params,config = SimpleNamespace(rbc=np.asarray([1.])),SimpleNamespace(ftol=1e-16)
+        mask = SimpleNamespace(R_cos=np.ones((1,2)))
+        def host(actual_config,actual_params):
+            self.assertIs(actual_config,config)
+            self.assertIs(actual_params,params)
+            self.assertEqual(active,[])
+            calls.append('host')
+            return SimpleNamespace(state=state,iterations=3)
+        def refine(actual_config,actual_params,actual_state,actual_mask):
+            self.assertIs(actual_config,config)
+            self.assertIs(actual_params,params)
+            self.assertIs(actual_state,state)
+            self.assertIs(actual_mask,mask)
+            self.assertEqual(active,[])
+            calls.append('refine')
+            return state
+        def solve(actual_params,actual_config):
+            self.assertIs(actual_params,params)
+            self.assertIs(actual_config,config)
+            self.assertEqual(active,[])
+            calls.append('solve')
+            solved=implicit._host_solve(actual_config,actual_params)
+            return implicit._refine_fixed_point(actual_config,actual_params,solved.state,mask)
+        def solve_aux(actual_params,actual_config):
+            self.assertIs(actual_params,params)
+            self.assertIs(actual_config,config)
+            self.assertEqual(active,[])
+            calls.append('solve_aux')
+            return state,mask
+        implicit=SimpleNamespace(solve_implicit=solve,solve_implicit_with_aux=solve_aux,
+                                 _host_solve=host,_refine_fixed_point=refine)
         compiler = object()
         api = SimpleNamespace()
         geo = SimpleNamespace(_import_booz_xform_jax_api=lambda:api)
@@ -67,30 +148,57 @@ class PointReplayTests(unittest.TestCase):
                 yield
             finally:
                 active.pop()
-        modules={'jax':SimpleNamespace(), 'jax._src':SimpleNamespace(compiler=compiler)}
+        modules={'jax':SimpleNamespace(config=SimpleNamespace(jax_default_device='cpu')), 'jax._src':SimpleNamespace(compiler=compiler),
+                 'vmex.core.implicit':implicit,
+                 'threadpoolctl':SimpleNamespace(threadpool_info=lambda:[{'num_threads':1}])}
         with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules), \
              patch.object(sys,'path',[str(FILE.parent),*sys.path]), \
-             patch.object(replay,'capture_ntx_ir',side_effect=ir),redirect_stdout(io.StringIO()):
+             patch.object(replay,'capture_ntx_ir',side_effect=ir), \
+             patch.dict(replay.os.environ,{'OMP_NUM_THREADS':'1'}),redirect_stdout(io.StringIO()):
             out=Path(directory)/'geometry'
             with self.assertRaisesRegex(ValueError,'original guard failure'):
                 with replay.capture_geometry_boundaries(out,geo):
+                    self.assertIs(implicit.solve_implicit(params,config),state)
+                    actual_state,actual_mask=implicit.solve_implicit_with_aux(params,config)
+                    self.assertIs(actual_state,state)
+                    self.assertIs(actual_mask,mask)
                     self.assertIs(geo._build_neopax_geometry_from_state(object(),state,n_r=51),geometry)
                     self.assertEqual(list(out.glob('*.npz')),[])
                     raise ValueError('original guard failure')
             manifest=json.loads((out/'boundaries.json').read_text())
-            self.assertEqual([r['stage'] for r in manifest],['geometry','boozer_inputs','projection','boozer'])
+            self.assertEqual([r['stage'] for r in manifest],
+                             ['vmec_solve','vmec_host','vmec_refinement','vmec_solve',
+                              'geometry','boozer_inputs','projection','boozer'])
             self.assertTrue(all(r['completed'] and r['fields'] for r in manifest))
+            with np.load(out/manifest[0]['file'],allow_pickle=False) as z:
+                np.testing.assert_array_equal(z['capture.params.rbc'],params.rbc)
+                self.assertEqual(float(z['capture.config.ftol']),config.ftol)
+                np.testing.assert_array_equal(z['capture.outputs.R_cos'],state.R_cos)
             with np.load(out/manifest[1]['file'],allow_pickle=False) as z:
+                self.assertEqual(int(z['capture.outputs.iterations']),3)
+                self.assertEqual(str(z['capture.default_device']),'cpu')
+                np.testing.assert_array_equal(z['capture.outputs.state.R_cos'],state.R_cos)
+            with np.load(out/manifest[2]['file'],allow_pickle=False) as z:
+                np.testing.assert_array_equal(z['capture.state.R_cos'],state.R_cos)
+                np.testing.assert_array_equal(z['capture.outputs.R_cos'],state.R_cos)
+            with np.load(out/manifest[5]['file'],allow_pickle=False) as z:
                 np.testing.assert_array_equal(z['capture.state.R_cos'],state.R_cos)
                 np.testing.assert_array_equal(z['capture.outputs.bmnc'],tables.bmnc)
-            with np.load(out/manifest[3]['file'],allow_pickle=False) as z:
+            with np.load(out/manifest[7]['file'],allow_pickle=False) as z:
                 np.testing.assert_array_equal(z['capture.inputs.bmnc'],tables.bmnc)
                 np.testing.assert_array_equal(z['capture.outputs.bmnc_b'],result['bmnc_b'])
             self.assertIs(geo._build_neopax_geometry_from_state,build)
             self.assertIs(geo._booz_xform_inputs_from_state,inputs)
             self.assertIs(geo._vmec_boozer_fourier_projection,project)
             self.assertIs(api.booz_xform_from_inputs,boozer)
-        self.assertEqual(calls,['geometry','inputs','project','boozer'])
+            self.assertIs(implicit.solve_implicit,solve)
+            self.assertIs(implicit.solve_implicit_with_aux,solve_aux)
+            self.assertIs(implicit._host_solve,host)
+            self.assertIs(implicit._refine_fixed_point,refine)
+            environment=json.loads((out/'runtime_environment.json').read_text())
+            self.assertEqual(environment['environment']['OMP_NUM_THREADS'],'1')
+            self.assertEqual(environment['threadpools'],[{'num_threads':1}])
+        self.assertEqual(calls,['solve','host','refine','solve_aux','geometry','inputs','project','boozer'])
         self.assertEqual(active,[])
         self.assertNotIn('jax',sys.modules)
 

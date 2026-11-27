@@ -133,10 +133,11 @@ def compare_preparations(results, out_dir, *, fail_on_difference=True):
 
 @contextmanager
 def capture_geometry_boundaries(directory, geometry_module):
-    """Observe the actual geometry/Boozer path; defer array copies until exit."""
+    """Observe the actual VMEX/geometry/Boozer path; defer copies until exit."""
     from unittest.mock import patch
     from check_generic_ntx_database_baselines import capture_tree
     from check_saved_transport_baseline_repeatability import numeric_leaves
+    import jax
     from jax._src import compiler
 
     directory = Path(directory)
@@ -150,20 +151,36 @@ def capture_geometry_boundaries(directory, geometry_module):
                 payload = dict(values=args[0], basis=args[1])
             elif stage == 'boozer_inputs':
                 payload = dict(state=kwargs['state'])
+            elif stage == 'vmec_solve':
+                payload = dict(params=args[0], config=args[1], options=kwargs)
+            elif stage == 'vmec_host':
+                payload = dict(config=args[0], params=args[1], options=kwargs)
+            elif stage == 'vmec_refinement':
+                payload = dict(config=args[0], params=args[1], state=args[2], mask=args[3], options=kwargs)
             else:
                 payload = dict(kwargs)
+            if stage.startswith('vmec_'):
+                payload['default_device'] = str(getattr(getattr(jax,'config',None),'jax_default_device',None))
             index = len(records)
             records.append((stage, payload))
             # The geometry scope also observes input preparation and any
             # interpolation after the transform. Nested scopes retain the
             # actual compilations, never a newly lowered/replayed program.
-            with capture_ntx_ir(directory/f'{index:04d}_{stage}_compiler', compiler):
+            scope = (nullcontext() if stage.startswith('vmec_') else
+                     capture_ntx_ir(directory/f'{index:04d}_{stage}_compiler', compiler))
+            with scope:
                 result = original(*args, **kwargs)
             payload['outputs'] = result
             return result
         return call
     try:
         with ExitStack() as patches:
+            implicit = sys.modules.get('vmex.core.implicit')
+            if implicit is not None:
+                for name,stage in (('solve_implicit','vmec_solve'),('solve_implicit_with_aux','vmec_solve'),
+                                   ('_host_solve','vmec_host'),('_refine_fixed_point','vmec_refinement')):
+                    if hasattr(implicit,name):
+                        patches.enter_context(patch.object(implicit,name,observed(stage,getattr(implicit,name))))
             for owner, name, stage in (
                 (geometry_module, '_build_neopax_geometry_from_state', 'geometry'),
                 (geometry_module, '_booz_xform_inputs_from_state', 'boozer_inputs'),
@@ -186,6 +203,16 @@ def capture_geometry_boundaries(directory, geometry_module):
             if name.startswith(('NEOPAX.', 'vmex.', 'booz_xform_jax.', 'solvax.'))
             and getattr(module, '__file__', None) and Path(module.__file__).suffix == '.py'}
         (directory/'loaded_sources.json').write_text(json.dumps(sources, indent=2))
+        try:
+            from threadpoolctl import threadpool_info
+            pools = threadpool_info()
+        except ImportError:
+            pools = None
+        (directory/'runtime_environment.json').write_text(json.dumps(dict(
+            environment={name:os.environ.get(name) for name in (
+                'OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS',
+                'BLIS_NUM_THREADS','NPROC','JAX_PLATFORMS','XLA_FLAGS')},
+            threadpools=pools),indent=2))
         print(f'[geometry-live] saved {len(records)} actual geometry/projection/Boozer boundaries in {directory}; no replay', flush=True)
 
 

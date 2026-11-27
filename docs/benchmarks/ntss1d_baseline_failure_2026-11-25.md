@@ -234,3 +234,60 @@ modes, unchanged transport arguments on continuation, four-worker planning,
 baseline validation and preservation of the original run. A plan-only
 read of the real archived case selects exactly the four missing FD columns.
 No local JAX import or physics calculation was performed.
+
+### Failed follow-up: difference already in the returned VMEX state
+
+The transferred `ntss1d_remaining_fd16_NITMkg.tar.gz` contains the failed
+density-shape-alpha initialization at `1be936f`. No new FD column completed.
+NumPy-only comparison with the passing `boozer_geometry_drift_0uRP9E`
+capture and archived AD finds the first saved difference before the first
+geometry/Boozer call: the returned equilibrium state already differs.
+
+| State field | Changed solved entries | Changed frozen entries | Maximum absolute difference |
+| --- | ---: | ---: | ---: |
+| R_cos | 14331 | 0 | 3.836930773104541e-13 |
+| Z_sin | 14134 | 0 | 2.771116669464391e-13 |
+| L_sin | 14200 | 0 | 2.666519782756893e-12 |
+
+The radial edge R/Z coefficients match exactly, as do all entries outside
+the saved DOF mask. Both Boozer input bundles differ in seven numerical
+fields, including iota (`4.719113988471690e-12`). All 18 projection bases,
+Boozer constants, angular grids and surface selections match; the values
+supplied to the projections already differ. Loaded mathematical-source
+hashes match the passing capture, and the saved TOML bytes match archived AD.
+Geometry B0 differs by `1.636024649087631e-12`; all 1232 normalized D13
+entries differ, with maximum `7.274030838753554e-3`.
+
+This identifies state drift upstream of Boozer for this failed execution.
+It does not establish which operation inside the VMEX solve first differs,
+and does not retroactively explain older failures with matching native
+surface arrays. The forty equal isolated Boozer calls remain consistent
+with this new result: those calls held their actual inputs fixed.
+
+There is an execution-environment confound in the follow-up command:
+`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1` was added to its parent, and the
+existing worker-environment helper passes these variables to the physical
+workers. The passing three-initialization command inherited the shell's
+thread settings instead. Actual earlier thread-pool counts were not
+recorded. Source review finds host NumPy matrix products in VMEX's axis
+guess, but this alone does not prove that those products caused this drift.
+The added limits were unnecessary for the comparison and are not a remedy.
+
+`check_vmec_thread_context.py` runs two original geometry-only prefixes:
+inherited settings and the explicit one-thread settings. It preserves the
+same saved config, numerical methods and tolerances, and stops before NTX,
+roots, transport and FD endpoints. The observer now retains the actual
+public VMEX parameters/config/result, original host-solve result, and the
+existing fixed-point-refinement input/output, without replaying or changing
+any of these operations. It also records the selected thread environment
+and loaded BLAS thread pools when threadpoolctl is available.
+The default-device context is also recorded at VMEX entry and inside the
+host-solve/refinement callbacks; a CUDA default-backend log alone does not
+describe the device context inside a host callback.
+
+The comparison checks parameter/config and source equality before attributing
+any state difference to the thread control. An inherited-state match to saved
+AD and a one-thread mismatch would support restoring the original execution
+environment. Equal results would not establish this hypothesis; the internal
+captures then locate whether drift first appears in the host solve or its
+existing refinement. No solver correction or tolerance change is activated.
